@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Teleprompter</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: system-ui, -apple-system, sans-serif; }
+        
+        #controls {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: rgba(0, 0, 0, 0.9);
+            padding: 15px;
+            z-index: 1000;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        #controls button, #controls input[type="file"] {
+            padding: 8px 16px;
+            cursor: pointer;
+            border: none;
+            border-radius: 4px;
+            background: #007bff;
+            color: white;
+            font-size: 14px;
+        }
+        
+        #controls button:hover { background: #0056b3; }
+        #controls button:disabled { background: #6c757d; cursor: not-allowed; }
+        
+        #controls label { color: white; font-size: 14px; }
+        #controls input[type="color"] { cursor: pointer; height: 32px; border: none; }
+        
+        #videoContainer {
+            position: fixed;
+            top: 80px;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            transition: background-color 0.3s;
+        }
+        
+        #video {
+            display: none;
+        }
+        
+        #canvas {
+            max-width: 640px;
+            max-height: 480px;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        }
+        
+        #script {
+            position: fixed;
+            top: 80px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90%;
+            max-width: 1000px;
+            max-height: 400px;
+            overflow-y: auto;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            font-size: 24px;
+            line-height: 1.6;
+            z-index: 999;
+            display: none;
+        }
+        
+        #script::-webkit-scrollbar { width: 8px; }
+        #script::-webkit-scrollbar-track { background: rgba(255,255,255,0.1); }
+        #script::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.3); border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <input type="file" id="docUpload" accept=".docx,.doc,.txt" />
+        <button id="startCamera">Start Camera</button>
+        <button id="recordBtn" disabled>Start Recording</button>
+        <button id="stopBtn" disabled>Stop Recording</button>
+        <button id="scrollBtn" disabled>Start Scroll</button>
+        <label for="bgColor">Background:</label>
+        <input type="color" id="bgColor" value="#4a90e2" />
+        <label for="fontSize">Text Size:</label>
+        <input type="range" id="fontSize" min="16" max="48" value="24" style="width: 100px;" />
+        <label for="scrollSpeed">Scroll Speed:</label>
+        <input type="range" id="scrollSpeed" min="1" max="10" value="3" style="width: 100px;" />
+    </div>
+    
+    <div id="videoContainer">
+        <video id="video" autoplay muted playsinline></video>
+        <canvas id="canvas"></canvas>
+    </div>
+    
+    <div id="script"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils"></script>
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const scriptDiv = document.getElementById('script');
+        const videoContainer = document.getElementById('videoContainer');
+        const docUpload = document.getElementById('docUpload');
+        const startCameraBtn = document.getElementById('startCamera');
+        const recordBtn = document.getElementById('recordBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const scrollBtn = document.getElementById('scrollBtn');
+        const bgColor = document.getElementById('bgColor');
+        const fontSize = document.getElementById('fontSize');
+        const scrollSpeed = document.getElementById('scrollSpeed');
+        
+        let mediaRecorder;
+        let recordedChunks = [];
+        let stream;
+        let selfieSegmentation;
+        let backgroundColor = bgColor.value;
+        let isScrolling = false;
+        let scrollInterval;
+
+        // Handle document upload
+        docUpload.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            if (file.name.endsWith('.txt')) {
+                const text = await file.text();
+                scriptDiv.textContent = text;
+                scriptDiv.style.display = 'block';
+                scrollBtn.disabled = false;
+            } else if (file.name.endsWith('.docx') || file.name.endsWith('.doc')) {
+                const arrayBuffer = await file.arrayBuffer();
+                const result = await mammoth.extractRawText({ arrayBuffer });
+                scriptDiv.textContent = result.value;
+                scriptDiv.style.display = 'block';
+                scrollBtn.disabled = false;
+            }
+        });
+
+        // Background color
+        bgColor.addEventListener('input', (e) => {
+            backgroundColor = e.target.value;
+        });
+
+        // Font size
+        fontSize.addEventListener('input', (e) => {
+            scriptDiv.style.fontSize = e.target.value + 'px';
+        });
+
+        // Start camera
+        startCameraBtn.addEventListener('click', async () => {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { width: 1280, height: 720 }, 
+                    audio: true 
+                });
+                video.srcObject = stream;
+                
+                // Wait for video to load
+                await new Promise(resolve => {
+                    video.onloadedmetadata = () => {
+                        canvas.width = video.videoWidth;
+                        canvas.height = video.videoHeight;
+                        resolve();
+                    };
+                });
+                
+                // Initialize MediaPipe Selfie Segmentation
+                selfieSegmentation = new SelfieSegmentation({
+                    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`
+                });
+                
+                selfieSegmentation.setOptions({
+                    modelSelection: 1, // 0 for general, 1 for landscape (better quality)
+                });
+                
+                selfieSegmentation.onResults(onResults);
+                
+                // Start processing frames
+                processFrame();
+                
+                startCameraBtn.disabled = true;
+                recordBtn.disabled = false;
+            } catch (err) {
+                alert('Camera access denied: ' + err.message);
+            }
+        });
+        
+        function onResults(results) {
+            ctx.save();
+            
+            // Draw solid background first
+            ctx.fillStyle = backgroundColor;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            // Create a temporary canvas for the masked person
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = canvas.width;
+            tempCanvas.height = canvas.height;
+            const tempCtx = tempCanvas.getContext('2d');
+            
+            // Draw the video frame
+            tempCtx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+            
+            // Apply the mask to keep only the person
+            tempCtx.globalCompositeOperation = 'destination-in';
+            tempCtx.drawImage(results.segmentationMask, 0, 0, canvas.width, canvas.height);
+            
+            // Draw the masked person on top of the background
+            ctx.drawImage(tempCanvas, 0, 0);
+            
+            ctx.restore();
+        }
+        
+        async function processFrame() {
+            if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                await selfieSegmentation.send({ image: video });
+            }
+            requestAnimationFrame(processFrame);
+        }
+
+        // Start recording
+        recordBtn.addEventListener('click', () => {
+            recordedChunks = [];
+            
+            // Record from canvas instead of video stream
+            const canvasStream = canvas.captureStream(30); // 30 fps
+            
+            // Add audio track from original stream
+            const audioTracks = stream.getAudioTracks();
+            if (audioTracks.length > 0) {
+                canvasStream.addTrack(audioTracks[0]);
+            }
+            
+            // Use codec that supports audio
+            const options = { mimeType: 'video/webm;codecs=vp8,opus' };
+            if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                options.mimeType = 'video/webm';
+            }
+            
+            mediaRecorder = new MediaRecorder(canvasStream, options);
+            
+            mediaRecorder.ondataavailable = (e) => {
+                if (e.data.size > 0) recordedChunks.push(e.data);
+            };
+            
+            mediaRecorder.onstop = () => {
+                const blob = new Blob(recordedChunks, { type: 'video/webm' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `recording-${Date.now()}.webm`;
+                a.click();
+            };
+            
+            mediaRecorder.start();
+            recordBtn.disabled = true;
+            stopBtn.disabled = false;
+        });
+
+        // Stop recording
+        stopBtn.addEventListener('click', () => {
+            mediaRecorder.stop();
+            recordBtn.disabled = false;
+            stopBtn.disabled = true;
+        });
+        
+        // Auto-scroll controls
+        scrollBtn.addEventListener('click', () => {
+            if (isScrolling) {
+                clearInterval(scrollInterval);
+                scrollBtn.textContent = 'Start Scroll';
+                isScrolling = false;
+            } else {
+                const speed = parseInt(scrollSpeed.value);
+                scrollInterval = setInterval(() => {
+                    scriptDiv.scrollTop += 1;
+                    // Stop at bottom
+                    if (scriptDiv.scrollTop >= scriptDiv.scrollHeight - scriptDiv.clientHeight) {
+                        clearInterval(scrollInterval);
+                        scrollBtn.textContent = 'Start Scroll';
+                        isScrolling = false;
+                    }
+                }, 100 / speed);
+                scrollBtn.textContent = 'Pause Scroll';
+                isScrolling = true;
+            }
+        });
+        
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.code === 'Space' && scriptDiv.style.display === 'block') {
+                e.preventDefault();
+                scrollBtn.click();
+            }
+        });
+    </script>
+</body>
+</html>
